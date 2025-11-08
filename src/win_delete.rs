@@ -1,7 +1,7 @@
-use anyhow::{Context, Result};
+use anyhow::Result;
 use rayon::prelude::*;
 use std::{
-    ffi::{c_void, OsStr},
+    ffi::c_void,
     mem::{size_of, zeroed},
     os::windows::ffi::OsStrExt,
     path::{Path, PathBuf},
@@ -10,55 +10,34 @@ use walkdir::WalkDir;
 use windows::{
     core::{PCWSTR, PWSTR},
     Win32::{
-        Foundation::{CloseHandle, BOOLEAN, HANDLE, WIN32_ERROR},
+        Foundation::{CloseHandle, HANDLE, WIN32_ERROR, LUID},
         Security::{
             AdjustTokenPrivileges, CreateWellKnownSid, GetTokenInformation, LookupPrivilegeValueW,
-            TokenElevation, ACE_FLAGS, OWNER_SECURITY_INFORMATION, PROTECTED_DACL_SECURITY_INFORMATION,
+            TokenElevation, OWNER_SECURITY_INFORMATION, PROTECTED_DACL_SECURITY_INFORMATION,
             TOKEN_ADJUST_PRIVILEGES, TOKEN_ELEVATION, TOKEN_PRIVILEGES,
-            TOKEN_PRIVILEGES_ATTRIBUTES, TOKEN_QUERY,
-            SE_BACKUP_NAME, SE_RESTORE_NAME, SE_TAKE_OWNERSHIP_NAME,
+            TOKEN_PRIVILEGES_ATTRIBUTES, TOKEN_QUERY, DACL_SECURITY_INFORMATION,
+            LUID_AND_ATTRIBUTES, PSID, ACL, WELL_KNOWN_SID_TYPE, WinBuiltinAdministratorsSid,
         },
         Security::Authorization::{
             SetEntriesInAclW, SetNamedSecurityInfoW, ACCESS_MODE, EXPLICIT_ACCESS_W,
-            NO_MULTIPLE_TRUSTEE, TRUSTEE_FORM, TRUSTEE_TYPE, TRUSTEE_W, DACL_SECURITY_INFORMATION,
-            TRUSTEE_IS_SID, TRUSTEE_IS_USER,
+            NO_MULTIPLE_TRUSTEE, SE_FILE_OBJECT, TRUSTEE_FORM, TRUSTEE_TYPE,
+            TRUSTEE_W, TRUSTEE_IS_SID, TRUSTEE_IS_USER,
         },
         Storage::FileSystem::{
             CreateFileW, DeleteFileW, FindClose, FindFirstFileExW, FindNextFileW, GetFileAttributesW,
             RemoveDirectoryW, SetFileAttributesW, SetFileInformationByHandle, WIN32_FIND_DATAW,
-            FILE_DISPOSITION_INFO, FILE_DISPOSITION_INFO_EX, FILE_DISPOSITION_INFO_EX_FLAGS,
-            FILE_DISPOSITION_FLAG_DELETE, FILE_DISPOSITION_FLAG_IGNORE_READONLY_ATTRIBUTE,
-            FILE_DISPOSITION_FLAG_POSIX_SEMANTICS, FILE_FLAGS_AND_ATTRIBUTES, FILE_GENERIC_WRITE,
-            FILE_INFO_BY_HANDLE_CLASS, FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE, FILE_SHARE_MODE,
-            FILE_SHARE_READ, FILE_SHARE_WRITE, FINDEX_INFO_LEVELS, FINDEX_SEARCH_OPS,
-            FIND_FIRST_EX_FLAGS, FIND_FIRST_EX_LARGE_FETCH, OPEN_EXISTING,
+            FILE_DISPOSITION_INFO_EX, FILE_DISPOSITION_INFO_EX_FLAGS, FILE_DISPOSITION_FLAG_DELETE,
+            FILE_DISPOSITION_FLAG_IGNORE_READONLY_ATTRIBUTE, FILE_DISPOSITION_FLAG_POSIX_SEMANTICS,
+            FILE_FLAGS_AND_ATTRIBUTES, FILE_GENERIC_WRITE, FILE_READ_ATTRIBUTES, FILE_SHARE_MODE,
+            FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, FINDEX_INFO_LEVELS,
+            FINDEX_SEARCH_OPS, FIND_FIRST_EX_FLAGS, FIND_FIRST_EX_LARGE_FETCH, OPEN_EXISTING,
             FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_READONLY, FILE_ATTRIBUTE_REPARSE_POINT,
-            FindExInfoBasic, FindExSearchNameMatch, FileDispositionInfo, FileDispositionInfoEx,
+            FindExInfoBasic, FindExSearchNameMatch, FileDispositionInfoEx, FILE_FLAG_BACKUP_SEMANTICS,
+            FILE_FLAG_OPEN_REPARSE_POINT, DELETE,
         },
         System::Threading::{GetCurrentProcess, OpenProcessToken},
     },
 };
-
-/// exportable constants for caller
-pub const SE_BACKUP_NAME: PCWSTR = SE_BACKUP_NAME;
-pub const SE_RESTORE_NAME: PCWSTR = SE_RESTORE_NAME;
-pub const SE_TAKE_OWNERSHIP_NAME: PCWSTR = SE_TAKE_OWNERSHIP_NAME;
-
-/// Keep UTF-16 buffer alive across Win32 calls
-struct Wide(Vec<u16>);
-impl Wide {
-    fn from_os(s: &OsStr) -> Self {
-        let mut v: Vec<u16> = s.encode_wide().collect();
-        v.push(0);
-        Self(v)
-    }
-    fn from_path(p: &Path) -> Self {
-        Self::from_os(p.as_os_str())
-    }
-    fn pcw(&self) -> PCWSTR {
-        PCWSTR(self.0.as_ptr())
-    }
-}
 
 /// Add \\?\ or \\?\UNC\ to allow long paths
 pub fn add_verbatim_prefix(p: &Path) -> PathBuf {
@@ -98,24 +77,21 @@ pub fn require_elevation() -> Result<()> {
     Ok(())
 }
 
-/// Try to enable useful privileges
+/// Try to enable useful privileges (names are PCWSTR constants like SE_BACKUP_NAME)
 pub fn enable_privileges(names: &[PCWSTR]) -> Result<()> {
     unsafe {
         let mut token = HANDLE::default();
         OpenProcessToken(GetCurrentProcess(), TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY, &mut token)?;
-
         for &name in names {
-            let mut luid = windows::Win32::Foundation::LUID::default();
+            let mut luid = LUID::default();
             LookupPrivilegeValueW(None, name, &mut luid)?;
-
             let tp = TOKEN_PRIVILEGES {
                 PrivilegeCount: 1,
-                Privileges: [windows::Win32::Security::LUID_AND_ATTRIBUTES {
+                Privileges: [LUID_AND_ATTRIBUTES {
                     Luid: luid,
                     Attributes: TOKEN_PRIVILEGES_ATTRIBUTES(2), // SE_PRIVILEGE_ENABLED
                 }],
             };
-
             AdjustTokenPrivileges(token, false, Some(&tp), 0, None, None)?;
         }
         CloseHandle(token)?;
@@ -123,7 +99,7 @@ pub fn enable_privileges(names: &[PCWSTR]) -> Result<()> {
     Ok(())
 }
 
-/// Bottom-up delete using WalkDir (simple, safe)
+/// Simple bottom-up walk
 pub fn force_delete_tree_walkdir(root: &Path, fix_acl: bool, verbose: bool) -> Result<()> {
     for entry in WalkDir::new(root).follow_links(false).contents_first(true) {
         let entry = entry?;
@@ -163,30 +139,31 @@ pub fn dry_run_tree(root: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Low-level delete a file or link. Tries POSIX + ignore-readonly.
+/// File or link delete. Uses POSIX semantics + ignore readonly. Retries with ACL fix if requested.
 pub fn force_delete_file(path: &Path, fix_acl: bool, verbose: bool) -> Result<()> {
     clear_readonly(path).ok();
 
-    // For reparse points, open the link itself
-    let attrs: u32 = unsafe { GetFileAttributesW(Wide::from_path(path).pcw()) };
+    let attrs: u32 = unsafe { GetFileAttributesW(pcw(path)) };
     let rp = attrs != u32::MAX && (attrs & FILE_ATTRIBUTE_REPARSE_POINT.0) != 0;
 
-    let flags_attr = FILE_FLAGS_AND_ATTRIBUTES(0);
-    let open_flags = if rp { FILE_FLAGS_AND_ATTRIBUTES(0x00200000) } else { FILE_FLAGS_AND_ATTRIBUTES(0) }; // FILE_FLAG_OPEN_REPARSE_POINT
+    let desired: u32 = (DELETE | FILE_READ_ATTRIBUTES | FILE_GENERIC_WRITE).0;
+    let share = FILE_SHARE_MODE(FILE_SHARE_READ.0 | FILE_SHARE_WRITE.0 | FILE_SHARE_DELETE.0);
+    let flags = if rp { FILE_FLAG_OPEN_REPARSE_POINT } else { FILE_FLAGS_AND_ATTRIBUTES(0) };
 
     let h = unsafe {
-        CreateFileW(
-            Wide::from_path(path).pcw(),
-            (windows::Win32::Storage::FileSystem::DELETE | FILE_READ_ATTRIBUTES | FILE_GENERIC_WRITE) as u32,
-            FILE_SHARE_MODE(FILE_SHARE_READ.0 | FILE_SHARE_WRITE.0 | FILE_SHARE_DELETE.0),
-            None,
-            OPEN_EXISTING,
-            FILE_FLAGS_AND_ATTRIBUTES(open_flags.0 | flags_attr.0),
-            None,
-        )?
+        match CreateFileW(pcw(path), desired, share, None, OPEN_EXISTING, flags, None) {
+            Ok(h) => h,
+            Err(e) => {
+                if fix_acl {
+                    take_ownership_and_grant_admins(path)?;
+                    return force_delete_file(path, false, verbose);
+                } else {
+                    return Err(e.into());
+                }
+            }
+        }
     };
 
-    // Prefer Ex with POSIX semantics
     let mut ex = FILE_DISPOSITION_INFO_EX {
         Flags: FILE_DISPOSITION_INFO_EX_FLAGS(
             FILE_DISPOSITION_FLAG_DELETE.0
@@ -196,13 +173,18 @@ pub fn force_delete_file(path: &Path, fix_acl: bool, verbose: bool) -> Result<()
     };
 
     unsafe {
-        SetFileInformationByHandle(
+        match SetFileInformationByHandle(
             h,
             FileDispositionInfoEx,
             &mut ex as *mut _ as *const c_void,
             size_of::<FILE_DISPOSITION_INFO_EX>() as u32,
-        )?;
-        CloseHandle(h)?;
+        ) {
+            Ok(_) => CloseHandle(h)?,
+            Err(_) => {
+                CloseHandle(h)?;
+                let _ = DeleteFileW(pcw(path));
+            }
+        }
     }
 
     if verbose {
@@ -215,22 +197,35 @@ pub fn force_delete_file(path: &Path, fix_acl: bool, verbose: bool) -> Result<()
 pub fn force_delete_dir(path: &Path, fix_acl: bool, verbose: bool) -> Result<()> {
     clear_readonly(path).ok();
 
-    let attrs: u32 = unsafe { GetFileAttributesW(Wide::from_path(path).pcw()) };
+    let attrs: u32 = unsafe { GetFileAttributesW(pcw(path)) };
     let is_rp = attrs != u32::MAX && (attrs & FILE_ATTRIBUTE_REPARSE_POINT.0) != 0;
 
-    let base = 0x02000000; // FILE_FLAG_BACKUP_SEMANTICS
-    let flags = if is_rp { base | 0x00200000 } else { base }; // + FILE_FLAG_OPEN_REPARSE_POINT
+    let desired: u32 = (DELETE | FILE_READ_ATTRIBUTES).0;
+    let share = FILE_SHARE_MODE(FILE_SHARE_READ.0 | FILE_SHARE_WRITE.0 | FILE_SHARE_DELETE.0);
+    let mut flags = FILE_FLAG_BACKUP_SEMANTICS;
+    if is_rp {
+        flags = FILE_FLAGS_AND_ATTRIBUTES(flags.0 | FILE_FLAG_OPEN_REPARSE_POINT.0);
+    }
 
     let h = unsafe {
-        CreateFileW(
-            Wide::from_path(path).pcw(),
-            (windows::Win32::Storage::FileSystem::DELETE | FILE_READ_ATTRIBUTES) as u32,
-            FILE_SHARE_MODE(FILE_SHARE_READ.0 | FILE_SHARE_WRITE.0 | FILE_SHARE_DELETE.0),
-            None,
-            OPEN_EXISTING,
-            FILE_FLAGS_AND_ATTRIBUTES(flags),
-            None,
-        )?
+        match CreateFileW(pcw(path), desired, share, None, OPEN_EXISTING, flags, None) {
+            Ok(h) => h,
+            Err(e) => {
+                if fix_acl {
+                    take_ownership_and_grant_admins(path)?;
+                    return force_delete_dir(path, false, verbose);
+                } else {
+                    let ok = RemoveDirectoryW(pcw(path));
+                    if ok.is_err() {
+                        return Err(e.into());
+                    }
+                    if verbose {
+                        eprintln!("deleted dir: {}", path.display());
+                    }
+                    return Ok(());
+                }
+            }
+        }
     };
 
     let mut ex = FILE_DISPOSITION_INFO_EX {
@@ -241,13 +236,18 @@ pub fn force_delete_dir(path: &Path, fix_acl: bool, verbose: bool) -> Result<()>
         ),
     };
     unsafe {
-        SetFileInformationByHandle(
+        match SetFileInformationByHandle(
             h,
             FileDispositionInfoEx,
             &mut ex as *mut _ as *const c_void,
             size_of::<FILE_DISPOSITION_INFO_EX>() as u32,
-        )?;
-        CloseHandle(h)?;
+        ) {
+            Ok(_) => CloseHandle(h)?,
+            Err(_) => {
+                CloseHandle(h)?;
+                let _ = RemoveDirectoryW(pcw(path));
+            }
+        }
     }
 
     if verbose {
@@ -258,36 +258,37 @@ pub fn force_delete_dir(path: &Path, fix_acl: bool, verbose: bool) -> Result<()>
 
 fn clear_readonly(path: &Path) -> Result<()> {
     unsafe {
-        let w = Wide::from_path(path);
-        let attrs: u32 = GetFileAttributesW(w.pcw());
+        let attrs: u32 = GetFileAttributesW(pcw(path));
         if attrs == u32::MAX {
             return Ok(());
         }
         if (attrs & FILE_ATTRIBUTE_READONLY.0) != 0 {
-            SetFileAttributesW(w.pcw(), FILE_FLAGS_AND_ATTRIBUTES(attrs & !FILE_ATTRIBUTE_READONLY.0))?;
+            SetFileAttributesW(
+                pcw(path),
+                FILE_FLAGS_AND_ATTRIBUTES(attrs & !FILE_ATTRIBUTE_READONLY.0),
+            )?;
         }
     }
     Ok(())
 }
 
-/// Take ownership + grant BUILTIN\\Administrators full control (GENERIC_ALL)
+/// Take ownership + grant BUILTIN\Administrators full control (GENERIC_ALL)
 pub fn take_ownership_and_grant_admins(path: &Path) -> Result<()> {
     unsafe {
-        // Build Administrators SID
         let mut admins_sid_buf = [0u8; 68];
         let mut sid_len = admins_sid_buf.len() as u32;
         CreateWellKnownSid(
-            windows::Win32::Security::WELL_KNOWN_SID_TYPE(windows::Win32::Security::WinBuiltinAdministratorsSid.0),
+            WELL_KNOWN_SID_TYPE(WinBuiltinAdministratorsSid.0),
             None,
-            windows::Win32::Security::PSID(admins_sid_buf.as_mut_ptr() as *mut _),
+            PSID(admins_sid_buf.as_mut_ptr() as *mut _),
             &mut sid_len,
         )?;
 
         // EXPLICIT_ACCESS for GENERIC_ALL
         let mut ea = EXPLICIT_ACCESS_W::default();
-        ea.grfAccessPermissions = 0x10000000 | 0x20000000 | 0x40000000 | 0x80000000; // GENERIC_ALL
+        ea.grfAccessPermissions = 0x1000_0000 | 0x2000_0000 | 0x4000_0000 | 0x8000_0000; // GENERIC_ALL
         ea.grfAccessMode = ACCESS_MODE(1); // GRANT_ACCESS
-        ea.grfInheritance = ACE_FLAGS(0);
+        ea.grfInheritance = Default::default();
 
         let mut trustee = TRUSTEE_W::default();
         trustee.pMultipleTrustee = std::ptr::null_mut();
@@ -303,14 +304,13 @@ pub fn take_ownership_and_grant_admins(path: &Path) -> Result<()> {
             anyhow::bail!("SetEntriesInAclW failed: win32={}", res.0);
         }
 
-        // Set owner + DACL and protect DACL
         let hr: WIN32_ERROR = SetNamedSecurityInfoW(
-            Wide::from_path(path).pcw() as *mut _,
-            windows::Win32::Security::SE_OBJECT_TYPE::SE_FILE_OBJECT,
+            pcw(path),
+            SE_FILE_OBJECT,
             OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
-            windows::Win32::Security::PSID(admins_sid_buf.as_mut_ptr() as *mut _),
-            None,
-            new_dacl,
+            PSID(admins_sid_buf.as_mut_ptr() as *mut _),
+            PSID::default(),
+            Some(new_dacl as *const ACL),
             None,
         );
         if hr != WIN32_ERROR(0) {
@@ -334,14 +334,17 @@ fn collect_tree_fast(root: &Path) -> Result<(Vec<PathBuf>, Vec<PathBuf>)> {
 
         unsafe {
             let mut data: WIN32_FIND_DATAW = zeroed();
-            let h = FindFirstFileExW(
-                Wide::from_path(&pattern).pcw(),
+            let h = match FindFirstFileExW(
+                pcw(&pattern),
                 FINDEX_INFO_LEVELS(FindExInfoBasic.0),
                 &mut data as *mut _ as *mut c_void,
                 FINDEX_SEARCH_OPS(FindExSearchNameMatch.0),
                 None,
                 FIND_FIRST_EX_FLAGS(FIND_FIRST_EX_LARGE_FETCH.0),
-            )?;
+            ) {
+                Ok(h) => h,
+                Err(_) => continue,
+            };
 
             loop {
                 let name = utf16z_to_string(&data.cFileName);
@@ -372,4 +375,12 @@ fn collect_tree_fast(root: &Path) -> Result<(Vec<PathBuf>, Vec<PathBuf>)> {
 fn utf16z_to_string(buf: &[u16]) -> String {
     let len = buf.iter().position(|&c| c == 0).unwrap_or(buf.len());
     String::from_utf16_lossy(&buf[..len])
+}
+
+fn pcw(p: &Path) -> PCWSTR {
+    let mut v: Vec<u16> = p.as_os_str().encode_wide().collect();
+    if v.is_empty() || *v.last().unwrap() != 0 {
+        v.push(0);
+    }
+    PCWSTR(v.as_ptr())
 }
