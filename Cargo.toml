@@ -1,0 +1,23 @@
+[package]
+name = "sfvdd"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+rayon = "1"
+walkdir = "2"
+windows = { version = "0.58", features = [
+  "Win32_Foundation",
+  "Win32_Security",
+  "Win32_Security_Authorization",
+  "Win32_Storage_FileSystem",
+  "Win32_System_Threading",
+  "Win32_System_SystemServices",
+] }
+
+[profile.release]
+lto = "fat"
+codegen-units = 1
+strip = true
